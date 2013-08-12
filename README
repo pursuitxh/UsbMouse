@@ -1,0 +1,8 @@
+Target: make JZ2440 as an USB mouse or USB keyBoard.
+
+BootLoader:   u-boot-2013.7
+Kernel    :   linux-3.2.50
+
+Hardware  :   JZ2440
+
+Note: I know that f_hid.c has already in linux standard kernel, but I want to implent this feature by myself, this will help me understand linux usb gadget deeply, also it will improve my ability of coding.
