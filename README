@@ -1,8 +1,18 @@
-Target: make JZ2440 as an USB mouse or USB keyBoard.
+Target: make JZ2440 as an USB mouse.
 
 BootLoader:   u-boot-2013.7
 Kernel    :   linux-3.2.50
 
 Hardware  :   JZ2440
 
-Note: I know that f_hid.c has already in linux standard kernel, but I want to implent this feature by myself, this will help me understand linux usb gadget deeply, also it will improve my ability of coding.
+How to build:
+1. you should enable udc driver in your kernel;
+2. cp the jz2440_mouse.c and Makefile into drivers/usb/gadget(Note: you should save you original Makefile)
+3. make
+
+How to install:
+1. copy the jz2440_mouse.ko into your development board;
+2.  execute insmod jz2440_mouse.ko
+
+How to uninstall:
+1. rmmod jz2440_mouse
