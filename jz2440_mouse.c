@@ -16,6 +16,8 @@
 #include <linux/poll.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <mach/regs-gpio.h>
+#include <plat/gpio-fns.h>
 
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
@@ -333,10 +335,96 @@ static void jzmouseg_disable(struct usb_function *f)
 
 }
 
-static int jzmouseg_ctrlrequest(struct usb_function *f,
+static int jzmouseg_setup(struct usb_function *f,
 		const struct usb_ctrlrequest *ctrl)
 {
-	return 0;
+	struct f_jzmouseg		*jzmouseg = func_to_jzmouseg(f);
+	struct usb_composite_dev	*cdev = f->config->cdev;
+	struct usb_request		*req  = cdev->req;
+	int status = 0;
+	__u16 value, length;
+
+	value	= __le16_to_cpu(ctrl->wValue);
+	length	= __le16_to_cpu(ctrl->wLength);
+
+	INFO(cdev, "hid_setup crtl_request : bRequestType:0x%x bRequest:0x%x "
+		"Value:0x%x\n", ctrl->bRequestType, ctrl->bRequest, value);
+
+	switch ((ctrl->bRequestType << 8) | ctrl->bRequest) {
+	case ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
+		  | HID_REQ_GET_REPORT):
+		INFO(cdev, "get_report\n");
+
+		/* send an empty report */
+		length = min_t(unsigned, length, jzmouseg->report_length);
+		memset(req->buf, 0x0, length);
+
+		goto respond;
+		break;
+
+	case ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
+		  | HID_REQ_GET_PROTOCOL):
+		INFO(cdev, "get_protocol\n");
+		goto stall;
+		break;
+
+	case ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
+		  | HID_REQ_SET_REPORT):
+		INFO(cdev, "set_report | wLenght=%d\n", ctrl->wLength);
+		req->context  = jzmouseg;
+		//req->complete = jzmouseg_set_report_complete;
+		goto respond;
+		break;
+
+	case ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
+		  | HID_REQ_SET_PROTOCOL):
+		INFO(cdev, "set_protocol\n");
+		goto stall;
+		break;
+
+	case ((USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_INTERFACE) << 8
+		  | USB_REQ_GET_DESCRIPTOR):
+		switch (value >> 8) {
+		case HID_DT_HID:
+			INFO(cdev, "USB_REQ_GET_DESCRIPTOR: HID\n");
+			length = min_t(unsigned short, length,
+						   jzmouseg_desc.bLength);
+			memcpy(req->buf, &jzmouseg_desc, length);
+			goto respond;
+			break;
+		case HID_DT_REPORT:
+			INFO(cdev, "USB_REQ_GET_DESCRIPTOR: REPORT\n");
+			length = min_t(unsigned short, length,
+					jzmouseg->report_desc_length);
+			memcpy(req->buf, jzmouseg->report_desc, length);
+			goto respond;
+			break;
+
+		default:
+			INFO(cdev, "Unknown decriptor request 0x%x\n",
+				 value >> 8);
+			goto stall;
+			break;
+		}
+		break;
+
+	default:
+		INFO(cdev, "Unknown request 0x%x\n",
+			 ctrl->bRequest);
+		goto stall;
+		break;
+	}
+
+stall:
+	return -EOPNOTSUPP;
+
+respond:
+	req->zero = 0;
+	req->length = length;
+	status = usb_ep_queue(cdev->gadget->ep0, req, GFP_ATOMIC);
+	if (status < 0)
+		ERROR(cdev, "usb_ep_queue error on ep0 %d\n", value);
+	return status;
 }
 
 static int __init jz_mouse_bind_config(struct usb_configuration *c)
@@ -369,7 +457,7 @@ static int __init jz_mouse_bind_config(struct usb_configuration *c)
 	jzmouseg->func.unbind  = jzmouseg_unbind;
 	jzmouseg->func.set_alt = jzmouseg_set_alt;
 	jzmouseg->func.disable = jzmouseg_disable;
-	jzmouseg->func.setup   = jzmouseg_ctrlrequest;
+	jzmouseg->func.setup   = jzmouseg_setup;
 
 	status = usb_add_function(c, &jzmouseg->func);
 	if (status)
@@ -508,6 +596,9 @@ static int __init jz_mouseg_init(void)
 {
 	int status;
 
+	s3c2410_gpio_cfgpin(S3C2410_GPC(5),S3C2410_GPIO_OUTPUT);
+	s3c2410_gpio_setpin(S3C2410_GPC(5),0);
+
 	status = platform_device_register(&jz_mouse);
 	if (status < 0){
 		platform_device_unregister(&jz_mouse);
@@ -526,6 +617,9 @@ static int __init jz_mouseg_init(void)
 		platform_device_unregister(&jz_mouse);
 		platform_driver_unregister(&jz_mouseg_plat_driver);
 	}
+	
+	/* Enable usb device function */
+	s3c2410_gpio_setpin(S3C2410_GPC(5),1);
 
 	printk(KERN_INFO "%s: success!\n", __FUNCTION__);
 
