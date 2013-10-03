@@ -8,11 +8,64 @@ Hardware  :   JZ2440
 How to build:
 1. you should enable udc driver in your kernel;
 2. cp the jz2440_mouse.c and Makefile into drivers/usb/gadget(Note: you should save you original Makefile)
-3. make
+3. make, and it will generate jz2440_mouse.ko
+4. use arm-linux-gcc -o jz2440_mouse_test jz2440_mouse_test.c to compile the test application
 
 How to install:
 1. copy the jz2440_mouse.ko into your development board;
-2.  execute insmod jz2440_mouse.ko
+2. execute insmod jz2440_mouse.ko
+3. execute ./jz2440_mouse_test &
 
 How to uninstall:
 1. rmmod jz2440_mouse
+
+Note: you should add platform devices in arch/arm/mach-s3c2440/mach-smdk2440.c
+
+#include <linux/usb/g_hid.h>
+
+static struct hidg_func_descriptor jzmouse_descriptor = {
+	.subclass 		= 0, /* No subclass */
+	.protocol 		= 2, /* mouse */
+	.report_length 		= 8,
+	.report_desc_length	= 52,
+	.report_desc 		= {
+		0x05, 0x01, /* USAGE_PAGE (Generic Desktop) */
+		0x09, 0x02, /* USAGE (Mouse) */
+		0xa1, 0x01, /* COLLECTION (Application) */
+		0x09, 0x01, /* USAGE (Pointer) */
+		0xa1, 0x00, /* COLLECTION (Physical) */
+		0x05, 0x09, /* USAGE_PAGE (Button) */
+		0x19, 0x01, /* USAGE_MINIMUM (Button 1) */
+		0x29, 0x03, /* USAGE_MAXIMUM (Button 3) */
+		0x15, 0x00, /* LOGICAL_MINIMUM (0) */
+		0x25, 0x01, /* LOGICAL_MAXIMUM (1) */
+		0x95, 0x03, /* REPORT_COUNT (3) */
+		0x75, 0x01, /* REPORT_SIZE (1) */
+		0x81, 0x02, /* INPUT (DataVarAbs) */
+		0x95, 0x01, /* REPORT_COUNT (1) */
+		0x75, 0x05, /* REPORT_SIZE (5) */
+		0x81, 0x03, /* INPUT (CnstVarAbs) */
+		0x05, 0x01, /* USAGE_PAGE (Generic Desktop) */
+		0x09, 0x30, /* USAGE (X) */
+		0x09, 0x31, /* USAGE (Y) */
+		0x09, 0x38, /* USAGE (Wheel) */
+		0x15, 0x81, /* LOGICAL_MINIMUM (-127) */
+		0x25, 0x7f, /* LOGICAL_MAXIMUM (127) */
+		0x75, 0x08, /* REPORT_SIZE (8) */
+		0x95, 0x03, /* REPORT_COUNT (3) */
+		0x81, 0x06, /* INPUT (DataVarRel) */
+		0xc0, 	    /* END_COLLECTION */
+		0xc0        /* END_COLLECTION */
+	}
+};
+
+static struct platform_device *smdk2440_devices[] __initdata = {
+	&s3c_device_ohci,
+	&s3c_device_lcd,
+	&s3c_device_wdt,
+	&s3c_device_i2c0,
+	&s3c_device_iis,
+	&smdk2440_device_eth,
+	&smdk2440_device_mouse,
+	&s3c_device_usbgadget,
+};

@@ -16,12 +16,19 @@
 #include <linux/poll.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <asm/irq.h>
+#include <linux/interrupt.h>
+#include <asm/io.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+#include <linux/irq.h>
 #include <mach/regs-gpio.h>
 #include <plat/gpio-fns.h>
 
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
 #include <linux/usb/composite.h>
+#include <linux/usb/g_hid.h>
 #include <linux/hid.h>
 
 #include "composite.c"
@@ -32,9 +39,10 @@
 #define DRIVER_DESC	"simulate jz2440 board into an usb mouse"
 #define DRIVER_VERSION	"2013/09/28"
 
-#define JZ_MOUSEG_VENDOR_NUM	0x0525
+#define JZ_MOUSEG_VENDOR_NUM	0x0525 /* XXX NetChip */
 #define JZ_MOUSEG_PRODUCT_NUM	0x0001
 
+/* JZ2440 Device descriptor */
 static struct usb_device_descriptor device_desc = {
 	.bLength =		sizeof device_desc,
 	.bDescriptorType =	USB_DT_DEVICE,
@@ -125,10 +133,7 @@ static struct usb_endpoint_descriptor jzmouseg_hs_in_ep_desc = {
 	.bEndpointAddress	= USB_DIR_IN,
 	.bmAttributes		= USB_ENDPOINT_XFER_INT,
 	/*.wMaxPacketSize	= DYNAMIC */
-	.bInterval		= 4, /* FIXME: Add this field in the
-				      * HID gadget configuration?
-				      * (struct hidg_func_descriptor)
-				      */
+	.bInterval		= 4,
 };
 
 static struct usb_descriptor_header *jzmouseg_hs_descriptors[] = {
@@ -145,10 +150,7 @@ static struct usb_endpoint_descriptor jzmouseg_fs_in_ep_desc = {
 	.bEndpointAddress	= USB_DIR_IN,
 	.bmAttributes		= USB_ENDPOINT_XFER_INT,
 	/*.wMaxPacketSize	= DYNAMIC */
-	.bInterval		= 10, /* FIXME: Add this field in the
-				       * HID gadget configuration?
-				       * (struct hidg_func_descriptor)
-				       */
+	.bInterval		= 10,
 };
 
 static struct usb_descriptor_header *jzmouseg_fs_descriptors[] = {
@@ -156,14 +158,6 @@ static struct usb_descriptor_header *jzmouseg_fs_descriptors[] = {
 	(struct usb_descriptor_header *)&jzmouseg_desc,
 	(struct usb_descriptor_header *)&jzmouseg_fs_in_ep_desc,
 	NULL,
-};
-
-struct jzmouseg_func_descriptor {
-	unsigned char		subclass;
-	unsigned char		protocol;
-	unsigned short		report_length;
-	unsigned short		report_desc_length;
-	unsigned char		report_desc[];
 };
 
 struct f_jzmouseg {
@@ -174,16 +168,6 @@ struct f_jzmouseg {
 	char				*report_desc;
 	unsigned short			report_length;
 
-	/* recv report */
-	char				*set_report_buff;
-	unsigned short			set_report_length;
-	spinlock_t			spinlock;
-	wait_queue_head_t		read_queue;
-
-	/* send report */
-	struct mutex			lock;
-	bool				write_pending;
-	wait_queue_head_t		write_queue;
 	struct usb_request		*req;
 
 	struct cdev			cdev;
@@ -191,43 +175,206 @@ struct f_jzmouseg {
 	struct usb_ep			*in_ep;
 };
 
-struct jzmouseg_func_descriptor *fdesc = NULL;
-static int major = 0;
-static int minor = 0;
+struct hidg_func_descriptor	*fdesc;
+
+#define JZMOUSEG_MAJOR	0
+#define JZMOUSEG_DRIVER_NAME "jzmouseg"
+static int jzmouseg_major = JZMOUSEG_MAJOR;
 static struct class *jzmouseg_class;
+
+static volatile unsigned long *gpfcon;
+static volatile unsigned long *gpfdat;
+static volatile unsigned long *gpgcon;
+static volatile unsigned long *gpgdat;
+static struct timer_list buttons_timer;
+static struct fasync_struct *button_async;
+
+struct pin_desc{
+	unsigned int irq;
+	unsigned int pin;
+	unsigned int key_val;
+	const char *name;
+};
+
+/* Key Down: 0x01, 0x02, 0x03, 0x04 */
+/* Key Up:   0x81, 0x82, 0x83, 0x84 */
+static unsigned char key_val;
+
+struct pin_desc pins_desc[4] = {
+	{IRQ_EINT0, S3C2410_GPF(0), 0x01, "S2"},
+	{IRQ_EINT2, S3C2410_GPF(2), 0x02, "S3"},
+	{IRQ_EINT11, S3C2410_GPG(3), 0x03, "S4"},
+	{IRQ_EINT19, S3C2410_GPG(11), 0x04, "S5"},
+};
+
+static struct pin_desc *irq_pd;
 
 static inline struct f_jzmouseg *func_to_jzmouseg(struct usb_function *f)
 {
 	return container_of(f, struct f_jzmouseg, func);
 }
 
-
-const struct file_operations f_jzmouseg_fops = {
-#if 0
-	.owner		= THIS_MODULE,
-	.open		= f_jzmouseg_open,
-	.release	= f_jzmouseg_release,
-	.write		= f_jzmouseg_write,
-	.read		= f_jzmouseg_read,
-	.poll		= f_jzmouseg_poll,
-	.llseek		= noop_llseek,
-#endif
-};
-
-static int __init g_jz_mouse_setup(struct usb_gadget *g, int count)
+static void buttons_timer_function(unsigned long data)
 {
-	int status;
-	dev_t dev;
+	struct pin_desc * pindesc = irq_pd;
+	unsigned int pinval;
 
-	jzmouseg_class = class_create(THIS_MODULE, "jzmouseg");
+	if (!pindesc)
+		return;
 
-	status = alloc_chrdev_region(&dev, 0, count, "jzmouseg");
-	if (!status) {
-		major = MAJOR(dev);
-		minor = count;
+	pinval = s3c2410_gpio_getpin(pindesc->pin);
+
+	if (pinval)
+		key_val = 0x80 | pindesc->key_val;
+	else
+		key_val = pindesc->key_val;
+
+	kill_fasync (&button_async, SIGIO, POLL_IN);
+}
+
+static irqreturn_t buttons_irq(int irq, void *dev_id)
+{
+	irq_pd = (struct pin_desc *)dev_id;
+	mod_timer(&buttons_timer, jiffies+HZ/100);
+	return IRQ_RETVAL(IRQ_HANDLED);
+}
+
+static void f_jzmouseg_req_complete(struct usb_ep *ep, struct usb_request *req)
+{
+	struct f_jzmouseg *jzmouseg = (struct f_jzmouseg *)ep->driver_data;
+
+	if (req->status != 0) {
+		ERROR(jzmouseg->func.config->cdev,
+			"End Point Request ERROR: %d\n", req->status);
+	}
+}
+
+static ssize_t f_jzmouseg_read(struct file *file, char __user *buffer,
+			size_t count, loff_t *ptr)
+{
+	struct f_jzmouseg	*jzmouseg     = file->private_data;
+	ssize_t status;
+	unsigned char mouse_buf[4] = {0, 0, 0, 0};
+
+	if (count != 1)
+		return -EINVAL;
+
+
+
+	if(key_val == 0x01) {
+		mouse_buf[0] |= 0x01;
+	} else if(key_val == 0x02) {
+		mouse_buf[0] |= 0x02;
+	} else if(key_val == 0x03) {
+		mouse_buf[0] |= 0x04;
+	}
+	memcpy(jzmouseg->req->buf, &mouse_buf, 4);
+	jzmouseg->req->status   = 0;
+	jzmouseg->req->zero     = 0;
+	jzmouseg->req->length   = 4;
+	jzmouseg->req->complete = f_jzmouseg_req_complete;
+	jzmouseg->req->context  = jzmouseg;
+
+	status = usb_ep_queue(jzmouseg->in_ep, jzmouseg->req, GFP_ATOMIC);
+
+	if (status < 0)
+		ERROR(jzmouseg->func.config->cdev,
+			"usb_ep_queue error on int endpoint %zd\n", status);
+
+	status = copy_to_user(buffer, &key_val, 1);
+	return status? -EFAULT : 0;
+}
+
+static int f_jzmouseg_fasync (int fd, struct file *filp, int on)
+{
+	pr_info("Enter %s function!\n", __func__);
+	return fasync_helper (fd, filp, on, &button_async);
+}
+
+static int f_jzmouseg_release(struct inode *inode, struct file *fd)
+{
+	int i;
+	fd->private_data = NULL;
+
+	for (i = 0; i < 4; i++)
+		free_irq(pins_desc[i].irq, &pins_desc[i]);
+
+	return 0;
+}
+
+static int f_jzmouseg_open(struct inode *inode, struct file *fd)
+{
+	int retval;
+	int i;
+
+	struct f_jzmouseg *jzmouseg =
+		container_of(inode->i_cdev, struct f_jzmouseg, cdev);
+
+	fd->private_data = jzmouseg;
+
+	for (i = 0; i < 4; i++)
+		retval = request_irq(pins_desc[i].irq,  buttons_irq,
+				(IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING),
+				pins_desc[i].name, &pins_desc[i]);
+	if (retval) {
+		i--;
+		for (; i>=0; i++)
+			free_irq(pins_desc[i].irq, &pins_desc[i]);
 	}
 
-	return status;
+	return 0;
+}
+
+const struct file_operations f_jzmouseg_fops = {
+	.owner		= THIS_MODULE,
+	.open		= f_jzmouseg_open,
+	.read		= f_jzmouseg_read,
+	.fasync		= f_jzmouseg_fasync,
+	.release	= f_jzmouseg_release,
+
+};
+
+static int __init gjzmouse_setup(struct f_jzmouseg *jzmouseg)
+{
+	int retval;
+	dev_t devnum = MKDEV(JZMOUSEG_MAJOR, 0);
+
+	if (jzmouseg_major) {
+		retval = register_chrdev_region(devnum, 1, JZMOUSEG_DRIVER_NAME);
+		pr_info("static jzmouseg major is: %d\n", jzmouseg_major);
+	} else {
+		retval = alloc_chrdev_region(&devnum, 0, 1, JZMOUSEG_DRIVER_NAME);
+		jzmouseg_major = MAJOR(devnum);
+		pr_info("automatic jzmouseg major is: %d\n", jzmouseg_major);
+	}
+
+	if (retval < 0) {
+		pr_err("jzmouseg driver: can't get major number...\n");
+		return retval;
+	}
+
+	jzmouseg_class = class_create(THIS_MODULE, "jz2440_hid");
+	device_create(jzmouseg_class, NULL, devnum, NULL, JZMOUSEG_DRIVER_NAME);
+
+	cdev_init(&jzmouseg->cdev, &f_jzmouseg_fops);
+	jzmouseg->cdev.owner = THIS_MODULE;
+	jzmouseg->cdev.ops = &f_jzmouseg_fops;
+
+	retval = cdev_add(&jzmouseg->cdev, devnum, 1);
+	if (retval)
+		pr_err("Error %d adding jzmouseg\n", retval);
+
+	init_timer(&buttons_timer);
+	buttons_timer.function = buttons_timer_function;
+	add_timer(&buttons_timer);
+
+	gpfcon = (volatile unsigned long *)ioremap(0x56000050, 16);
+	gpfdat = gpfcon + 1;
+
+	gpgcon = (volatile unsigned long *)ioremap(0x56000060, 16);
+	gpgdat = gpgcon + 1;
+
+	return retval;
 }
 
 static int __init jzmouseg_bind(struct usb_configuration *c, struct usb_function *f)
@@ -235,9 +382,8 @@ static int __init jzmouseg_bind(struct usb_configuration *c, struct usb_function
 	struct usb_ep		*ep;
 	struct f_jzmouseg	*jzmouseg = func_to_jzmouseg(f);
 	int			status;
-	dev_t			dev;
 
-	printk(KERN_INFO "Enter %s function...\n", __func__);
+	pr_info("Enter %s function!\n", __func__);
 
 	/* allocate instance-specific interface IDs, and patch descriptors */
 	status = usb_interface_id(c, f);
@@ -274,8 +420,6 @@ static int __init jzmouseg_bind(struct usb_configuration *c, struct usb_function
 	jzmouseg_desc.desc[0].wDescriptorLength =
 		cpu_to_le16(jzmouseg->report_desc_length);
 
-	jzmouseg->set_report_buff = NULL;
-
 	/* copy descriptors */
 	f->descriptors = usb_copy_descriptors(jzmouseg_fs_descriptors);
 	if (!f->descriptors)
@@ -289,19 +433,10 @@ static int __init jzmouseg_bind(struct usb_configuration *c, struct usb_function
 			goto fail;
 	}
 
-	mutex_init(&jzmouseg->lock);
-	spin_lock_init(&jzmouseg->spinlock);
-	init_waitqueue_head(&jzmouseg->write_queue);
-	init_waitqueue_head(&jzmouseg->read_queue);
-
-	/* create char device */
-	cdev_init(&jzmouseg->cdev, &f_jzmouseg_fops);
-	dev = MKDEV(major, minor);
-	status = cdev_add(&jzmouseg->cdev, dev, 1);
+	/* setup jzmouse device */
+	status = gjzmouse_setup(jzmouseg);
 	if (status)
 		goto fail;
-
-	device_create(jzmouseg_class, NULL, dev, NULL, "%s%d", "jzmouseg", 0);
 
 	return 0;
 
@@ -319,20 +454,72 @@ fail:
 	return status;
 }
 
+static void gjzmouse_cleanup(void)
+{
+	device_destroy(jzmouseg_class, MKDEV(jzmouseg_major, 0));
+	class_destroy(jzmouseg_class);
+	unregister_chrdev_region(MKDEV(jzmouseg_major, 0), 1);
+	iounmap(gpfcon);
+	iounmap(gpgcon);
+
+	pr_info("gjzmouse module removed successed!\n");
+}
+
 static void jzmouseg_unbind(struct usb_configuration *c, struct usb_function *f)
 {
+	struct f_jzmouseg *jzmouseg = func_to_jzmouseg(f);
 
+	gjzmouse_cleanup();
+	/* disable/free request and end point */
+	usb_ep_disable(jzmouseg->in_ep);
+	usb_ep_dequeue(jzmouseg->in_ep, jzmouseg->req);
+	kfree(jzmouseg->req->buf);
+	usb_ep_free_request(jzmouseg->in_ep, jzmouseg->req);
+
+	/* free descriptors copies */
+	usb_free_descriptors(f->hs_descriptors);
+	usb_free_descriptors(f->descriptors);
+
+	kfree(jzmouseg->report_desc);
+	kfree(jzmouseg);
 }
 
 static int jzmouseg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 {
+	struct usb_composite_dev *cdev = f->config->cdev;
+	struct f_jzmouseg *jzmouseg = func_to_jzmouseg(f);
+	int status = 0;
 
-	return 0;
+	INFO(cdev, "hidg_set_alt intf:%d alt:%d\n", intf, alt);
+
+	if (jzmouseg->in_ep != NULL) {
+		/* restart endpoint */
+		if (jzmouseg->in_ep->driver_data != NULL)
+			usb_ep_disable(jzmouseg->in_ep);
+
+		status = config_ep_by_speed(f->config->cdev->gadget, f,
+						jzmouseg->in_ep);
+		if (status) {
+			ERROR(cdev, "config_ep_by_speed FAILED!\n");
+			goto fail;
+		}
+		status = usb_ep_enable(jzmouseg->in_ep);
+		if (status < 0) {
+			ERROR(cdev, "Enable endpoint FAILED!\n");
+			goto fail;
+		}
+		jzmouseg->in_ep->driver_data = jzmouseg;
+	}
+fail:
+	return status;
 }
 
 static void jzmouseg_disable(struct usb_function *f)
 {
+	struct f_jzmouseg *jzmouseg = func_to_jzmouseg(f);
 
+	usb_ep_disable(jzmouseg->in_ep);
+	jzmouseg->in_ep->driver_data = NULL;
 }
 
 static int jzmouseg_setup(struct usb_function *f,
@@ -347,7 +534,7 @@ static int jzmouseg_setup(struct usb_function *f,
 	value	= __le16_to_cpu(ctrl->wValue);
 	length	= __le16_to_cpu(ctrl->wLength);
 
-	INFO(cdev, "hid_setup crtl_request : bRequestType:0x%x bRequest:0x%x "
+	INFO(cdev, "jzmouse_setup crtl_request : bRequestType:0x%x bRequest:0x%x "
 		"Value:0x%x\n", ctrl->bRequestType, ctrl->bRequest, value);
 
 	switch ((ctrl->bRequestType << 8) | ctrl->bRequest) {
@@ -372,7 +559,6 @@ static int jzmouseg_setup(struct usb_function *f,
 		  | HID_REQ_SET_REPORT):
 		INFO(cdev, "set_report | wLenght=%d\n", ctrl->wLength);
 		req->context  = jzmouseg;
-		//req->complete = jzmouseg_set_report_complete;
 		goto respond;
 		break;
 
@@ -427,12 +613,12 @@ respond:
 	return status;
 }
 
-static int __init jz_mouse_bind_config(struct usb_configuration *c)
+static int __init jzmouse_bind_config(struct usb_configuration *c)
 {
 	struct f_jzmouseg *jzmouseg;
 	int status;
 
-	printk(KERN_INFO "Enter %s function...\n", __func__);
+	pr_info("Enter %s function!\n", __func__);
 
 	/* allocate and initialize one new instance */
 	jzmouseg = kzalloc(sizeof *jzmouseg, GFP_KERNEL);
@@ -466,17 +652,13 @@ static int __init jz_mouse_bind_config(struct usb_configuration *c)
 	return status;
 }
 
-static int __init jz_mouse_bind(struct usb_composite_dev *cdev)
-{
-	printk(KERN_INFO "Enter %s function...\n", __func__);
 
+static int __init jzmouse_bind(struct usb_composite_dev *cdev)
+{
 	struct usb_gadget *gadget = cdev->gadget;
 	int status, gcnum;
 
-	/* set up jz_mouse */
-	status = g_jz_mouse_setup(cdev->gadget, 0);
-	if (status < 0)
-		return status;
+	pr_info("Enter %s function...\n", __func__);
 
 	gcnum = usb_gadget_controller_number(gadget);
 	if (gcnum >= 0)
@@ -484,14 +666,15 @@ static int __init jz_mouse_bind(struct usb_composite_dev *cdev)
 	else
 		device_desc.bcdDevice = cpu_to_le16(0x0300 | 0x0099);
 
-
 	/* device descriptor strings: manufacturer, product */
 	snprintf(manufacturer, sizeof manufacturer, "%s %s with %s",
 		init_utsname()->sysname, init_utsname()->release,
 		gadget->name);
+
 	status = usb_string_id(cdev);
 	if (status < 0)
 		return status;
+
 	strings_dev[STRING_MANUFACTURER_IDX].id = status;
 	device_desc.iManufacturer = status;
 
@@ -502,138 +685,82 @@ static int __init jz_mouse_bind(struct usb_composite_dev *cdev)
 	device_desc.iProduct = status;
 
 	/* register our configuration */
-	status = usb_add_config(cdev, &config_driver, jz_mouse_bind_config);
+	status = usb_add_config(cdev, &config_driver, jzmouse_bind_config);
 	if (status < 0)
 		return status;
 
 	dev_info(&gadget->dev, DRIVER_DESC ", version: " DRIVER_VERSION "\n");
 
 	return 0;
-
 }
 
-static int __exit jz_mouse_unbind(struct usb_composite_dev *cdev)
+static int __exit jzmouse_unbind(struct usb_composite_dev *cdev)
 {
 	return 0;
 }
 
-
-static int __init jz_mouseg_plat_driver_probe(struct platform_device *pdev)
+static int __init jzmouseg_plat_driver_probe(struct platform_device *pdev)
 {
-	fdesc = pdev->dev.platform_data;
+	 fdesc = pdev->dev.platform_data;
+
+	/* Enable JZ2440 USB Device Controller */
+	s3c2410_gpio_cfgpin(S3C2410_GPC(5),S3C2410_GPIO_OUTPUT);
+	s3c2410_gpio_setpin(S3C2410_GPC(5),1);
 
 	return 0;
 }
 
-static int __devexit jz_mouseg_plat_driver_remove(struct platform_device *pdev)
+static int __devexit jzmouseg_plat_driver_remove(struct platform_device *pdev)
 {
+	fdesc = NULL;
+
+	/* Disable JZ2440 USB Device Controller */
+	s3c2410_gpio_setpin(S3C2410_GPC(5),0);
+
 	return 0;
 }
 
-
-/* usb descriptor for a mouse */
-static struct jzmouseg_func_descriptor jzmouse_data = {
-	.subclass 		= 0, /* No subclass */
-	.protocol 		= 2, /* mouse */
-	.report_length 		= 8,
-	.report_desc_length	= 52,
-	.report_desc 		= {
-		0x05, 0x01, /* USAGE_PAGE (Generic Desktop) */
-		0x09, 0x02, /* USAGE (Mouse) */
-		0xa1, 0x01, /* COLLECTION (Application) */
-		0x09, 0x01, /* USAGE (Pointer) */
-		0xa1, 0x00, /* COLLECTION (Physical) */
-		0x05, 0x09, /* USAGE_PAGE (Button) */
-		0x19, 0x01, /* USAGE_MINIMUM (Button 1) */
-		0x29, 0x03, /* USAGE_MAXIMUM (Button 3) */
-		0x15, 0x00, /* LOGICAL_MINIMUM (0) */
-		0x25, 0x01, /* LOGICAL_MAXIMUM (1) */
-		0x95, 0x03, /* REPORT_COUNT (3) */
-		0x75, 0x01, /* REPORT_SIZE (1) */
-		0x81, 0x02, /* INPUT (DataVarAbs) */
-		0x95, 0x01, /* REPORT_COUNT (1) */
-		0x75, 0x05, /* REPORT_SIZE (5) */
-		0x81, 0x03, /* INPUT (CnstVarAbs) */
-		0x05, 0x01, /* USAGE_PAGE (Generic Desktop) */
-		0x09, 0x30, /* USAGE (X) */
-		0x09, 0x31, /* USAGE (Y) */
-		0x09, 0x38, /* USAGE (Wheel) */
-		0x15, 0x81, /* LOGICAL_MINIMUM (-127) */
-		0x25, 0x7f, /* LOGICAL_MAXIMUM (127) */
-		0x75, 0x08, /* REPORT_SIZE (8) */
-		0x95, 0x03, /* REPORT_COUNT (3) */
-		0x81, 0x06, /* INPUT (DataVarRel) */
-		0xc0, 	    /* END_COLLECTION */
-		0xc0        /* END_COLLECTION */
-	}
-};
-
-static struct platform_device jz_mouse = {
-	.name 			= "jz_mouseg",
-	.id			= 0,
-	.num_resources		= 0,
-	.resource    		= 0,
-	.dev.platform_data 	= &jzmouse_data,
-};
-
-static struct usb_composite_driver jz_mouseg_driver = {
-	.name		= "g_jz_mouse",
+static struct usb_composite_driver jzmouseg_driver = {
+	.name		= "g_jzmouse",
 	.dev		= &device_desc,
 	.strings	= dev_strings,
 	.max_speed	= USB_SPEED_HIGH,
-	.unbind		= __exit_p(jz_mouse_unbind),
+	.unbind		= __exit_p(jzmouse_unbind),
 };
 
-static struct platform_driver jz_mouseg_plat_driver = {
-	.remove		= __devexit_p(jz_mouseg_plat_driver_remove),
+static struct platform_driver jzmouseg_plat_driver = {
+	.remove		= __devexit_p(jzmouseg_plat_driver_remove),
 	.driver		= {
 		.owner	= THIS_MODULE,
 		.name	= "jz_mouseg",
 	},
 };
 
-static int __init jz_mouseg_init(void)
+static int __init jzmouseg_init(void)
 {
 	int status;
 
-	s3c2410_gpio_cfgpin(S3C2410_GPC(5),S3C2410_GPIO_OUTPUT);
-	s3c2410_gpio_setpin(S3C2410_GPC(5),0);
-
-	status = platform_device_register(&jz_mouse);
-	if (status < 0){
-		platform_device_unregister(&jz_mouse);
+	status = platform_driver_probe(&jzmouseg_plat_driver,
+				jzmouseg_plat_driver_probe);
+	if (status < 0)
 		return status;
-	}
 
-	status = platform_driver_probe(&jz_mouseg_plat_driver,
-				jz_mouseg_plat_driver_probe);
-	if (status < 0) {
-		platform_device_unregister(&jz_mouse);
-		return status;
-	}
+	status = usb_composite_probe(&jzmouseg_driver, jzmouse_bind);
+	if (status < 0)
+		platform_driver_unregister(&jzmouseg_plat_driver);
 
-	status = usb_composite_probe(&jz_mouseg_driver, jz_mouse_bind);
-	if (status < 0) {
-		platform_device_unregister(&jz_mouse);
-		platform_driver_unregister(&jz_mouseg_plat_driver);
-	}
-	
-	/* Enable usb device function */
-	s3c2410_gpio_setpin(S3C2410_GPC(5),1);
-
-	printk(KERN_INFO "%s: success!\n", __FUNCTION__);
+	pr_info("%s: success!\n", __func__);
 
 	return status;
 }
-module_init(jz_mouseg_init);
+module_init(jzmouseg_init);
 
-static void __exit jz_mouseg_cleanup(void)
+static void __exit jzmouseg_cleanup(void)
 {
-	platform_device_unregister(&jz_mouse);
-	platform_driver_unregister(&jz_mouseg_plat_driver);
-	usb_composite_unregister(&jz_mouseg_driver);
+	platform_driver_unregister(&jzmouseg_plat_driver);
+	usb_composite_unregister(&jzmouseg_driver);
 }
-module_exit(jz_mouseg_cleanup);
+module_exit(jzmouseg_cleanup);
 
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_AUTHOR("pursuitxh");
