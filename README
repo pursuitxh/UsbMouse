@@ -59,6 +59,14 @@ static struct hidg_func_descriptor jzmouse_descriptor = {
 	}
 };
 
+static struct platform_device smdk2440_device_mouse = { 
+    .name           = "jz_mouseg",
+    .id         = 0,
+    .num_resources      = 0,
+    .resource           = 0,
+    .dev.platform_data  = &jzmouse_descriptor,
+};
+
 static struct platform_device *smdk2440_devices[] __initdata = {
 	&s3c_device_ohci,
 	&s3c_device_lcd,
